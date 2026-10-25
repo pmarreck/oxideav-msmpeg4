@@ -439,18 +439,20 @@ fn ac_block_walks_reject_all_zero_blocks() {
 
 #[test]
 fn v1_v2_picture_headers_round_trip() {
-    for &(ptype, quant, umv) in &[
-        (PictureType::I, 4u8, false),
-        (PictureType::P, 4, false),
-        (PictureType::P, 31, true),
-        (PictureType::I, 1, false),
+    for &(ptype, quant, slice_code, use_skip) in &[
+        (PictureType::I, 4u8, 23u8, false),
+        (PictureType::P, 4, 0, true),
+        (PictureType::P, 31, 0, false),
+        (PictureType::I, 1, 31, false),
     ] {
         let hdr = MsV1V2PictureHeader {
             picture_type: ptype,
             quant,
-            v1_umv_flag: umv,
+            slice_code,
+            use_skip_mb_code: use_skip,
         };
-        // v1: 37-bit preamble + type/quant + P-only UMV.
+        // v1: 37-bit preamble + type/quant + I-only slice height; P-frames
+        // always use skip flags.
         let mut bw = BitWriter::new();
         hdr.write_v1(&mut bw).unwrap();
         let bytes = bw.finish();
@@ -458,8 +460,9 @@ fn v1_v2_picture_headers_round_trip() {
         let back = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
         assert_eq!(back.picture_type, ptype);
         assert_eq!(back.quant, quant);
-        assert_eq!(back.v1_umv_flag, ptype == PictureType::P && umv);
-        // v2: no preamble, no UMV.
+        assert_eq!(back.slice_code, slice_code);
+        assert_eq!(back.use_skip_mb_code, ptype == PictureType::P);
+        // v2: no preamble; I-only slice code, P-only skip-mode flag.
         let mut bw = BitWriter::new();
         hdr.write_v2(&mut bw).unwrap();
         let bytes = bw.finish();
@@ -467,7 +470,8 @@ fn v1_v2_picture_headers_round_trip() {
         let back = MsV1V2PictureHeader::parse_v2(&mut br).unwrap();
         assert_eq!(back.picture_type, ptype);
         assert_eq!(back.quant, quant);
-        assert!(!back.v1_umv_flag);
+        assert_eq!(back.slice_code, slice_code);
+        assert_eq!(back.use_skip_mb_code, use_skip);
     }
 }
 
@@ -500,7 +504,28 @@ fn v1_mcbpcy_round_trips_every_payload_symbol() {
 
 #[test]
 fn v2_mcbpcy_round_trips_all_symbols_both_frame_types() {
-    for &frame_type in &[V2FrameType::I, V2FrameType::P] {
+    // I-frames: the intra layout carries only the intra symbols 4..=7.
+    for mcbpc in 4..8u8 {
+        for &cbpy in &[0u8, 6, 15] {
+            for &ac_pred in &[false, true] {
+                let mut bw = BitWriter::new();
+                encode_mcbpcy_v2(&mut bw, V2FrameType::I, false, mcbpc, ac_pred, cbpy).unwrap();
+                let bytes = bw.finish();
+                let mut br = BitReader::new(&bytes);
+                let dec = decode_mcbpcy_v2(&mut br, V2FrameType::I).unwrap();
+                assert!(!dec.skip && dec.is_intra);
+                assert_eq!(dec.cbpy, cbpy, "I mcbpc {mcbpc}");
+                assert_eq!(dec.cbp_cb, mcbpc & 0b10 != 0);
+                assert_eq!(dec.cbp_cr, mcbpc & 0b01 != 0);
+                assert_eq!(dec.ac_pred, ac_pred);
+            }
+        }
+    }
+    for mcbpc in 0..4u8 {
+        let mut bw = BitWriter::new();
+        assert!(encode_mcbpcy_v2(&mut bw, V2FrameType::I, false, mcbpc, false, 0).is_err());
+    }
+    for &frame_type in &[V2FrameType::PNoSkip, V2FrameType::P] {
         for mcbpc in 0..8u8 {
             for &cbpy in &[0u8, 6, 15] {
                 for &ac_pred in &[false, true] {
@@ -528,6 +553,8 @@ fn v2_mcbpcy_round_trips_all_symbols_both_frame_types() {
     assert!(decode_mcbpcy_v2(&mut br, V2FrameType::P).unwrap().skip);
     let mut bw = BitWriter::new();
     assert!(encode_mcbpcy_v2(&mut bw, V2FrameType::I, true, 0, false, 0).is_err());
+    let mut bw = BitWriter::new();
+    assert!(encode_mcbpcy_v2(&mut bw, V2FrameType::PNoSkip, true, 0, false, 0).is_err());
 }
 
 #[test]

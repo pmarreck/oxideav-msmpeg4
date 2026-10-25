@@ -46,7 +46,7 @@ use crate::mb::{encode_intra_dc_diff_v1v2, encode_intra_dc_diff_v3};
 use crate::mc::{RefPlane, chroma_mv_from_four_luma, chroma_mv_from_luma, mc_block};
 use crate::mcbpcy::{
     V2FrameType, compose_cbp, encode_intra_cbpcy_sym, encode_mcbpcy, encode_mcbpcy_v1,
-    encode_mcbpcy_v2,
+    encode_mcbpcy_v1_iframe, encode_mcbpcy_v2,
 };
 use crate::mv::{
     Mv, MvTable, encode_mv_v1v2, encode_mv_with_table, mv_component_reachable,
@@ -1282,18 +1282,34 @@ pub fn encode_iframe_v1v2(
     let quant = config.quant as u32;
 
     let mut bw = BitWriter::new();
+    // One prediction slice per picture: v2 codes `22 + slices`, v1 the
+    // slice height itself, which caps a v1 picture at 31 macroblock
+    // rows (496 px) for this encoder. Multi-slice output would need
+    // predictor restarts in the analysis walks below.
+    let slice_code = match version {
+        MsV1V2Version::V1 => {
+            if mb_h > 31 {
+                return Err(Error::invalid(format!(
+                    "msmpeg4v1 encoder: {mb_h} macroblock rows exceed the 31-row single \
+                     slice this encoder emits"
+                )));
+            }
+            mb_h as u8
+        }
+        MsV1V2Version::V2 => 23,
+    };
     let hdr = crate::header::MsV1V2PictureHeader {
         picture_type: PictureType::I,
         quant: config.quant,
-        v1_umv_flag: false,
+        slice_code,
+        use_skip_mb_code: false,
     };
     match version {
         MsV1V2Version::V1 => hdr.write_v1(&mut bw)?,
         MsV1V2Version::V2 => hdr.write_v2(&mut bw)?,
     }
 
-    let luma_ac = AcVlcTable::v3_intra_g5();
-    let chroma_ac = AcVlcTable::g4_inter();
+    let (luma_ac, chroma_ac, _) = AcVlcTable::v1v2_tables(version == MsV1V2Version::V1);
     let mut dc_cache = DcCache::for_v1v2(mb_w, mb_h);
 
     for my in 0..mb_h {
@@ -1309,8 +1325,8 @@ pub fn encode_iframe_v1v2(
             };
             match version {
                 MsV1V2Version::V1 => {
-                    // MB-type 3 (INTRA): mcbpc = 3 << 2 | cbpc.
-                    encode_mcbpcy_v1(&mut bw, false, 12 + cbpc, cbpy)?;
+                    // I-frame intra header: H.263 intra MCBPC, no COD bit.
+                    encode_mcbpcy_v1_iframe(&mut bw, cbpc, cbpy)?;
                 }
                 MsV1V2Version::V2 => {
                     // Intra quotient (mcbpc / 4 == 1): mcbpc = 4 + cbpc;
@@ -1372,21 +1388,21 @@ pub fn encode_pframe_v1v2_with_stats(
     let hdr = crate::header::MsV1V2PictureHeader {
         picture_type: PictureType::P,
         quant: config.quant,
-        // The v1 UMV flag is consumed as framing but not branched on by
-        // the v<4 MV decoder body (spec/07 §3.4); write 0.
-        v1_umv_flag: false,
+        slice_code: 0,
+        // Every MB header carries a skip flag (v1 has no choice; v2
+        // writes the flag into the picture header).
+        use_skip_mb_code: true,
     };
     match version {
         MsV1V2Version::V1 => hdr.write_v1(&mut bw)?,
         MsV1V2Version::V2 => hdr.write_v2(&mut bw)?,
     }
 
-    let inter_ac = AcVlcTable::g4_inter();
-    // Intra-in-P AC tables: v1/v2 bind the default G5 luma / G4 chroma
-    // descriptors with no per-frame selector (spec/14 §3.2) — same
-    // pair as the v1/v2 I-frame path.
-    let intra_luma_ac = AcVlcTable::v3_intra_g5();
-    let intra_chroma_ac = AcVlcTable::g4_inter();
+    // v1/v2 bind the default G5 luma / G4 chroma / G4 inter descriptors
+    // with no per-frame selector (spec/14 §3.2); the escape body follows
+    // the version — same tables as the decoder's.
+    let (intra_luma_ac, intra_chroma_ac, inter_ac) =
+        AcVlcTable::v1v2_tables(version == MsV1V2Version::V1);
     // v1/v2 keep the fixed `+1` half-pel rounding (see `crate::mc`).
     let rounding = 0u8;
     let mut mv_grid = MvGrid::new(mb_w, mb_h);

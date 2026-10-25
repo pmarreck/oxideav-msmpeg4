@@ -219,8 +219,9 @@ impl AcVlcTable {
     /// table from the packed-Huffman source at file `0x58e38` / VMA
     /// `0x1c259a38`, per spec/11 §3-§5. Same shape as G5 (103 records,
     /// one ESC reserved) but with G4's symbol-index → (last, run, level)
-    /// mapping (`count_A=102, count_B=57` per spec/99 §5). Used by v3
-    /// inter blocks and v1/v2 inter+intra blocks.
+    /// mapping (`count_A=102, count_B=57` per spec/99 §5). The 1-tier
+    /// escape body is the v1 reading; v2 and v3 blocks take the ladder
+    /// variants ([`Self::v1v2_tables`], [`Self::inter_for_chroma_sel`]).
     pub fn g4_inter() -> AcVlcTable {
         AcVlcTable {
             entries: g4_primary_entries(),
@@ -271,6 +272,32 @@ impl AcVlcTable {
     /// Microsoft MP43 P-frame parses to its last macroblock under the
     /// ladder and desynchronises at the first escaped inter block
     /// under the 1-tier reading.
+    /// The AC tables of an MS-MPEG-4 **v1 / v2** picture, which have no
+    /// per-frame selectors: intra luma is G5, intra chroma and every
+    /// inter block G4. The escape body differs by version. v1 reads
+    /// the fixed-length `last(1) run(6) level(8)` body straight after
+    /// the ESC code in every block; v2 walks the same three-arm ladder
+    /// as v3 (level extension, run extension, verbatim), with the run
+    /// extension adding no extra one on inter blocks (the reference
+    /// decoder's `run_diff` is 0 for v2 and 1 for v3). Returns
+    /// `(intra_luma, intra_chroma, inter)`.
+    pub fn v1v2_tables(v1: bool) -> (AcVlcTable, AcVlcTable, AcVlcTable) {
+        if v1 {
+            let luma = AcVlcTable {
+                lmax: None,
+                rmax: None,
+                ..Self::v3_intra_g5()
+            };
+            (luma, Self::g4_inter(), Self::g4_inter())
+        } else {
+            (
+                Self::v3_intra_g5(),
+                Self::v3_intra_g4(),
+                Self::v3_intra_g4(),
+            )
+        }
+    }
+
     pub fn inter_for_chroma_sel(sel: u8) -> AcVlcTable {
         let base = match sel {
             0 => Self::v3_intra_g2(),

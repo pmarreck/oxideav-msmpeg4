@@ -507,14 +507,135 @@ pub fn decode_mcbpcy_v1(br: &mut BitReader<'_>) -> Result<V1V2McbpcyDecode> {
     })
 }
 
+/// v2 I-frame intra CBPC VLC (the reference decoder's `ff_v2_intra_cbpc`):
+/// the two chroma coded-block bits as a 4-symbol code, `0 → 1`,
+/// `1 → 000`, `2 → 001`, `3 → 01`. An I-frame macroblock carries no MB
+/// type: every one is intra, so the header is this code, the
+/// AC-prediction bit, then CBPY.
+const INTRA_CBPC_V2_RAW: &[(u8, u8, u32)] =
+    &[(0, 1, 0b1), (1, 3, 0b000), (2, 3, 0b001), (3, 2, 0b01)];
+
+static INTRA_CBPC_V2_TABLE: std::sync::OnceLock<Vec<VlcEntry<u8>>> = std::sync::OnceLock::new();
+
+fn intra_cbpc_v2_table() -> &'static [VlcEntry<u8>] {
+    INTRA_CBPC_V2_TABLE.get_or_init(|| build_vlc_from_triples(INTRA_CBPC_V2_RAW))
+}
+
+/// Decode one v2 I-frame macroblock header: intra CBPC (chroma coded-block
+/// bits, [`INTRA_CBPC_V2_RAW`]), the 1-bit AC-prediction flag, then CBPY
+/// read as coded (the intra sense of the H.263 table, no `15 - raw` wrap,
+/// which only inter MBs and v1 P-frame intra MBs apply). This is the
+/// reference decoder's `msmpeg4v12_decode_mb` I-picture path; the P-frame
+/// alphabet of [`decode_mcbpcy_v2`] does not apply to I-frames, whose
+/// first code would otherwise read as an inter MB type.
+pub fn decode_mcbpcy_v2_iframe(br: &mut BitReader<'_>) -> Result<V1V2McbpcyDecode> {
+    let cbpc = vlc::decode_named(br, intra_cbpc_v2_table(), "v2 intra cbpc")?;
+    let ac_pred = br.read_bit()?;
+    let cbpy = decode_cbpy_with_wrap(br, false)?;
+    Ok(V1V2McbpcyDecode {
+        skip: false,
+        mb_type: 3,
+        is_intra: true,
+        num_motion_vectors: 0,
+        cbpy,
+        cbp_cb: (cbpc & 0b10) != 0,
+        cbp_cr: (cbpc & 0b01) != 0,
+        ac_pred,
+    })
+}
+
+/// Encode one v2 I-frame macroblock header — the inverse of
+/// [`decode_mcbpcy_v2_iframe`]. `mcbpc` is the P-frame alphabet's intra
+/// symbol `4 + cbpc` so callers can share the composition rule; a
+/// non-intra symbol is rejected because an I-frame has no MB type.
+pub fn encode_mcbpcy_v2_iframe(
+    bw: &mut BitWriter,
+    mcbpc: u8,
+    ac_pred: bool,
+    cbpy: u8,
+) -> Result<()> {
+    if mcbpc >> 2 != 1 {
+        return Err(Error::invalid(format!(
+            "msmpeg4 v2 mcbpc: I-frame MBs are intra; symbol {mcbpc} is not in 4..=7"
+        )));
+    }
+    write_sym(bw, intra_cbpc_v2_table(), mcbpc & 0b11, "v2 intra cbpc")?;
+    bw.write_bit(ac_pred);
+    encode_cbpy_v1v2(bw, cbpy, false)
+}
+
+/// H.263 intra MCBPC (Table 8 / the reference decoder's
+/// `ff_h263_intra_MCBPC`): symbols 0..=3 are INTRA with `cbpc = sym`,
+/// 4..=7 INTRA+Q, 8 is stuffing. v1 I-frame macroblock headers use it
+/// without a leading COD bit.
+const INTRA_MCBPC_V1_RAW: &[(u8, u8, u32)] = &[
+    (0, 1, 0b1),
+    (1, 3, 0b001),
+    (2, 3, 0b010),
+    (3, 3, 0b011),
+    (4, 4, 0b0001),
+    (5, 6, 0b000001),
+    (6, 6, 0b000010),
+    (7, 6, 0b000011),
+    (8, 9, 0b000000001),
+];
+
+static INTRA_MCBPC_V1_TABLE: std::sync::OnceLock<Vec<VlcEntry<u8>>> = std::sync::OnceLock::new();
+
+fn intra_mcbpc_v1_table() -> &'static [VlcEntry<u8>] {
+    INTRA_MCBPC_V1_TABLE.get_or_init(|| build_vlc_from_triples(INTRA_MCBPC_V1_RAW))
+}
+
+/// Decode one v1 I-frame macroblock header: the H.263 intra MCBPC
+/// ([`INTRA_MCBPC_V1_RAW`], no COD bit since an I-frame has no skipped
+/// MBs), then CBPY read as coded (no wrap; the wrap applies to v1
+/// P-frame MBs only). INTRA+Q and stuffing symbols are rejected like
+/// the reference decoder does (`cbp > 3`). v1 has no AC prediction.
+pub fn decode_mcbpcy_v1_iframe(br: &mut BitReader<'_>) -> Result<V1V2McbpcyDecode> {
+    let sym = vlc::decode_named(br, intra_mcbpc_v1_table(), "v1 intra mcbpc")?;
+    if sym > 3 {
+        return Err(Error::invalid(format!(
+            "msmpeg4 v1 intra mcbpc: symbol {sym} (INTRA+Q / stuffing) is not a valid \
+             I-frame macroblock header"
+        )));
+    }
+    let cbpy = decode_cbpy_with_wrap(br, false)?;
+    Ok(V1V2McbpcyDecode {
+        skip: false,
+        mb_type: 3,
+        is_intra: true,
+        num_motion_vectors: 0,
+        cbpy,
+        cbp_cb: (sym & 0b10) != 0,
+        cbp_cr: (sym & 0b01) != 0,
+        ac_pred: false,
+    })
+}
+
+/// Encode one v1 I-frame macroblock header — the inverse of
+/// [`decode_mcbpcy_v1_iframe`]: intra MCBPC symbol `cbpc`, then the
+/// unwrapped CBPY.
+pub fn encode_mcbpcy_v1_iframe(bw: &mut BitWriter, cbpc: u8, cbpy: u8) -> Result<()> {
+    if cbpc > 3 {
+        return Err(Error::invalid(format!(
+            "msmpeg4 v1 intra mcbpc: cbpc {cbpc} out of 0..=3"
+        )));
+    }
+    write_sym(bw, intra_mcbpc_v1_table(), cbpc, "v1 intra mcbpc")?;
+    encode_cbpy_v1v2(bw, cbpy, false)
+}
+
 /// Frame-type context for the v2 MCBPCY decoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum V2FrameType {
-    /// I-frame: skip the leading skip-bit read (I-frames cannot have
-    /// skipped MBs). Per spec/07 §2.1: `cmp [ebx+0x88], 0; je`.
+    /// I-frame: every MB is intra and the header is the intra layout
+    /// of [`decode_mcbpcy_v2_iframe`] (no skip bit, no MB type).
     I,
-    /// P-frame: read 1-bit skip flag first.
+    /// P-frame with `use_skip_mb_code` set: read 1-bit skip flag first.
     P,
+    /// P-frame whose picture header cleared `use_skip_mb_code`: no skip
+    /// bit, every MB is coded.
+    PNoSkip,
 }
 
 /// Decode one v2 MCBPCY packet. Per spec/07 §2 (`0x1c21729c`):
@@ -533,10 +654,12 @@ pub fn decode_mcbpcy_v2(
     br: &mut BitReader<'_>,
     frame_type: V2FrameType,
 ) -> Result<V1V2McbpcyDecode> {
-    // P-frame: leading 1-bit skip read. I-frame: no skip bit.
+    // P-frame: leading 1-bit skip read when the picture header enabled
+    // skip flags. I-frame: the separate intra layout.
     let skip = match frame_type {
         V2FrameType::P => br.read_bit()?,
-        V2FrameType::I => false,
+        V2FrameType::PNoSkip => false,
+        V2FrameType::I => return decode_mcbpcy_v2_iframe(br),
     };
     if skip {
         return Ok(V1V2McbpcyDecode::skip_mb());
@@ -557,9 +680,11 @@ pub fn decode_mcbpcy_v2(
             (0u8, false, false, wrap)
         }
         1 => {
-            // Intra-in-P — read AC-prediction flag, then CBPY with wrap.
+            // Intra-in-P — read AC-prediction flag, then CBPY as coded: the
+            // reference decoder inverts CBPY only for inter MBs here (and
+            // for every v1 P-frame MB), not for a v2 intra MB.
             let ac = br.read_bit()?;
-            (3u8, true, ac, true)
+            (3u8, true, ac, false)
         }
         _ => {
             return Err(Error::invalid(format!(
@@ -652,12 +777,20 @@ pub fn encode_mcbpcy_v2(
 ) -> Result<()> {
     match frame_type {
         V2FrameType::P => bw.write_bit(skip),
+        V2FrameType::PNoSkip => {
+            if skip {
+                return Err(Error::invalid(
+                    "msmpeg4 v2 mcbpc: a P-frame without skip flags cannot carry skipped MBs",
+                ));
+            }
+        }
         V2FrameType::I => {
             if skip {
                 return Err(Error::invalid(
                     "msmpeg4 v2 mcbpc: I-frames cannot carry skipped MBs",
                 ));
             }
+            return encode_mcbpcy_v2_iframe(bw, mcbpc, ac_pred, cbpy);
         }
     }
     if skip {
@@ -671,9 +804,12 @@ pub fn encode_mcbpcy_v2(
     write_sym(bw, mcbpc_v2_table(), mcbpc, "v2 mcbpc")?;
     let quotient = mcbpc >> 2;
     let remainder = mcbpc & 0b11;
+    // Intra-in-P writes the AC-prediction bit and then CBPY as coded;
+    // only inter MBs (other than sub-type 3) wrap it (spec/07 §2.5 and
+    // the reference decoder).
     let apply_wrap = if quotient == 1 {
         bw.write_bit(ac_pred);
-        true
+        false
     } else {
         remainder != 3
     };
@@ -981,15 +1117,83 @@ mod tests {
     }
 
     #[test]
-    fn v2_mcbpcy_iframe_no_skip_bit_consumed() {
-        // I-frame: no skip bit. Decode MCBPC sym 0 directly.
-        let (mc_bl, mc_code) = v2_mcbpc_for(0);
+    fn v2_mcbpcy_iframe_uses_the_intra_layout() {
+        // I-frame: no skip bit, no MB type. Intra CBPC sym 3 (`01`),
+        // ac_pred = 1, then CBPY 15 as coded (no wrap).
         let (cb_bl, cb_code) = cbpy_for(15);
-        let bytes = pack(&[(mc_code, mc_bl as u32), (cb_code, cb_bl as u32)]);
+        let bytes = pack(&[(0b01, 2), (1, 1), (cb_code, cb_bl as u32)]);
         let mut br = BitReader::new(&bytes);
         let dec = decode_mcbpcy_v2(&mut br, V2FrameType::I).unwrap();
         assert!(!dec.skip);
-        assert_eq!(dec.mb_type, 0); // sym 0 → quotient=0 → mb_type=0
+        assert!(dec.is_intra);
+        assert_eq!(dec.mb_type, 3);
+        assert!(dec.ac_pred);
+        assert_eq!(dec.cbpy, 15);
+        assert!(dec.cbp_cb && dec.cbp_cr);
+        assert_eq!(br.bit_position(), 3 + cb_bl as u64);
+    }
+
+    #[test]
+    fn v2_intra_cbpc_codes_match_the_reference_decoder() {
+        // ff_v2_intra_cbpc: 0 → `1`, 1 → `000`, 2 → `001`, 3 → `01`.
+        for &(sym, bits, code) in &[
+            (0u8, 1u32, 0b1u32),
+            (1, 3, 0b000),
+            (2, 3, 0b001),
+            (3, 2, 0b01),
+        ] {
+            let (cb_bl, cb_code) = cbpy_for(0);
+            let bytes = pack(&[(code, bits), (0, 1), (cb_code, cb_bl as u32)]);
+            let mut br = BitReader::new(&bytes);
+            let dec = decode_mcbpcy_v2_iframe(&mut br).unwrap();
+            assert_eq!(dec.cbp_cb, sym & 0b10 != 0, "sym {sym}");
+            assert_eq!(dec.cbp_cr, sym & 0b01 != 0, "sym {sym}");
+            assert_eq!(dec.cbpy, 0);
+        }
+    }
+
+    #[test]
+    fn v1_iframe_header_has_no_cod_bit_and_no_cbpy_wrap() {
+        // Intra MCBPC sym 2 (`010`) then CBPY 15 as coded.
+        let (cb_bl, cb_code) = cbpy_for(15);
+        let bytes = pack(&[(0b010, 3), (cb_code, cb_bl as u32)]);
+        let mut br = BitReader::new(&bytes);
+        let dec = decode_mcbpcy_v1_iframe(&mut br).unwrap();
+        assert!(dec.is_intra && !dec.skip && !dec.ac_pred);
+        assert!(dec.cbp_cb && !dec.cbp_cr);
+        assert_eq!(dec.cbpy, 15);
+        // INTRA+Q (sym 4, `0001`) is rejected.
+        let bytes = pack(&[(0b0001, 4), (cb_code, cb_bl as u32)]);
+        let mut br = BitReader::new(&bytes);
+        assert!(decode_mcbpcy_v1_iframe(&mut br).is_err());
+    }
+
+    #[test]
+    fn v1_v2_iframe_headers_round_trip() {
+        for cbpc in 0..4u8 {
+            for &cbpy in &[0u8, 5, 10, 15] {
+                let mut bw = BitWriter::new();
+                encode_mcbpcy_v1_iframe(&mut bw, cbpc, cbpy).unwrap();
+                let bytes = bw.finish();
+                let mut br = BitReader::new(&bytes);
+                let dec = decode_mcbpcy_v1_iframe(&mut br).unwrap();
+                assert_eq!(
+                    (dec.cbp_cb, dec.cbp_cr, dec.cbpy),
+                    (cbpc & 2 != 0, cbpc & 1 != 0, cbpy)
+                );
+                for &ac in &[false, true] {
+                    let mut bw = BitWriter::new();
+                    encode_mcbpcy_v2_iframe(&mut bw, 4 + cbpc, ac, cbpy).unwrap();
+                    let bytes = bw.finish();
+                    let mut br = BitReader::new(&bytes);
+                    let dec = decode_mcbpcy_v2_iframe(&mut br).unwrap();
+                    assert_eq!(
+                        (dec.cbp_cb, dec.cbp_cr, dec.cbpy, dec.ac_pred),
+                        (cbpc & 2 != 0, cbpc & 1 != 0, cbpy, ac)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1011,7 +1215,7 @@ mod tests {
         assert_eq!(dec.mb_type, 3);
         assert!(dec.is_intra);
         assert!(dec.ac_pred, "intra-in-P MB must have ac_pred=true");
-        assert_eq!(dec.cbpy, 0);
+        assert_eq!(dec.cbpy, 15, "v2 intra-in-P reads CBPY as coded (no wrap)");
     }
 
     #[test]

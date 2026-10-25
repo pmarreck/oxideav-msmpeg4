@@ -70,14 +70,37 @@ fn code_for(table: &[(u8, u8, u32)], sym: u8) -> (u32, u32) {
 }
 
 /// v1 P-frame picture-header fields: 37-bit opaque preamble + 2-bit
-/// type (P = 1) + 5-bit quant + 1-bit UMV (spec/01 §1.4).
+/// type (P = 1) + 5-bit quant. v1 P-frames always use skip flags, so
+/// nothing follows PQUANT.
 fn v1_pframe_header(quant: u32) -> Vec<(u32, u32)> {
-    vec![(0, 32), (0, 5), (1, 2), (quant, 5), (0, 1)]
+    vec![(0, 32), (0, 5), (1, 2), (quant, 5)]
 }
 
-/// v2 P-frame picture-header fields: 2-bit type + 5-bit quant.
+/// v2 P-frame picture-header fields: 2-bit type + 5-bit quant + the
+/// 1-bit `use_skip_mb_code` flag (set: every MB header opens with a
+/// skip bit).
 fn v2_pframe_header(quant: u32) -> Vec<(u32, u32)> {
-    vec![(1, 2), (quant, 5)]
+    vec![(1, 2), (quant, 5), (1, 1)]
+}
+
+/// v1 I-frame picture-header fields for a one-MB-row picture: 37-bit
+/// preamble + type 0 (I) + quant + slice height 1.
+fn v1_iframe_header(quant: u32) -> Vec<(u32, u32)> {
+    vec![(0, 32), (0, 5), (0, 2), (quant, 5), (1, 5)]
+}
+
+/// v1 I-frame intra MB header: H.263 intra MCBPC symbol `cbpc` (no COD
+/// bit) + CBPY read as coded (no wrap).
+fn v1_iframe_mb_header(cbpc: u8, cbpy: u8) -> Vec<(u32, u32)> {
+    let mcbpc = match cbpc {
+        0 => (0b1, 1),
+        1 => (0b001, 3),
+        2 => (0b010, 3),
+        3 => (0b011, 3),
+        _ => panic!("cbpc {cbpc} out of 0..=3"),
+    };
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, cbpy);
+    vec![mcbpc, (cbpy_code, cbpy_bl)]
 }
 
 /// A 16x16 reference picture with a per-pel gradient so MC shifts are
@@ -294,16 +317,11 @@ fn v1_iframe_intra_dc_only_decodes_flat_grey() {
     // flat grey MB (DC differential 0 + spatial predictor 1024 → DC =
     // 1024 → IDCT → 128 per pel).
     let dims = PictureDims::new(16, 16).unwrap();
-    // v1 I-frame header: 37-bit preamble + type 0 (I) + quant 8.
-    let mut fields: Vec<(u32, u32)> = vec![(0, 32), (0, 5), (0, 2), (8, 5)];
-    // MB header: skip bit 0 (v1 reads the COD bit even on I-frames),
-    // MCBPC sym 12 (mb_type 3 = INTRA, CBPC 0), CBPY raw 15 → post-wrap
-    // 0 (no coded luma).
-    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 12);
-    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15);
-    fields.push((0, 1)); // skip / COD = 0
-    fields.push((mcbpc_code, mcbpc_bl));
-    fields.push((cbpy_code, cbpy_bl));
+    // v1 I-frame header: 37-bit preamble + type 0 (I) + quant 8 + slice
+    // height 1; MB header: intra MCBPC (CBPC 0), CBPY 0 as coded (no
+    // coded luma; I-frames have no COD bit and no CBPY wrap).
+    let mut fields = v1_iframe_header(8);
+    fields.extend(v1_iframe_mb_header(0, 0));
     // 6 DC-size-0 codewords (4 luma + 2 chroma), no value bits.
     let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
     let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
@@ -340,12 +358,8 @@ fn v1_iframe_intra_nonzero_dc_shifts_luma() {
     // the q=8 luma DC scaler the reconstructed DC moves the whole 8x8
     // block off 128.
     let dims = PictureDims::new(16, 16).unwrap();
-    let mut fields: Vec<(u32, u32)> = vec![(0, 32), (0, 5), (0, 2), (8, 5)];
-    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 12); // INTRA
-    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15); // post-wrap 0
-    fields.push((0, 1));
-    fields.push((mcbpc_code, mcbpc_bl));
-    fields.push((cbpy_code, cbpy_bl));
+    let mut fields = v1_iframe_header(8);
+    fields.extend(v1_iframe_mb_header(0, 0));
     // Luma block 0: size category 1, value bit 1 → diff +1.
     let (luma1_code, luma1_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 1);
     fields.push((luma1_code, luma1_bl));
@@ -379,21 +393,14 @@ fn v1_iframe_intra_nonzero_dc_shifts_luma() {
 }
 
 #[test]
-fn v1_iframe_intra_plus_q_mb_type_4_decodes() {
-    // Regression for the spec/16 §3.2 `is_intra` correction. MCBPC
-    // symbol 16 decodes to MB-type 4 (INTRA+Q): the authoritative
-    // `region_053140_mbtype.csv` marks it `is_intra = 1`. The previous
-    // `is_intra = mb_type == 3` test mis-classified it as inter, so
-    // `decode_iframe_v1v2` rejected the MB. With the table-driven
-    // classification it now reconstructs the same flat-grey DC-only MB
-    // as the MB-type 3 case (the INTRA / INTRA+Q distinction is the
-    // quant lineage name only at the DC-decode site).
+fn v1_iframe_intra_plus_q_is_rejected() {
+    // An I-frame MB header is the H.263 intra MCBPC; its INTRA+Q symbols
+    // (4..=7, here `0001` = symbol 4) carry no quantiser delta in this
+    // codec and the reference decoder rejects them (`cbp > 3`).
     let dims = PictureDims::new(16, 16).unwrap();
-    let mut fields: Vec<(u32, u32)> = vec![(0, 32), (0, 5), (0, 2), (8, 5)];
-    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V1_RAW, 16); // mb_type 4
-    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15); // post-wrap 0
-    fields.push((0, 1)); // skip / COD = 0
-    fields.push((mcbpc_code, mcbpc_bl));
+    let mut fields = v1_iframe_header(8);
+    fields.push((0b0001, 4)); // intra MCBPC symbol 4 (INTRA+Q, cbpc 0)
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 0);
     fields.push((cbpy_code, cbpy_bl));
     let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
     let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
@@ -405,18 +412,14 @@ fn v1_iframe_intra_plus_q_mb_type_4_decodes() {
     }
     let bytes = pack(&fields);
     let mut br = BitReader::new(&bytes);
-    let pic = decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, None)
-        .expect("v1 I-frame INTRA+Q (mb_type 4) must decode, not be rejected as inter");
-    assert_eq!(pic.picture_type, PictureType::I);
+    let err = match decode_picture_v1v2(&mut br, dims, MsV1V2Version::V1, None) {
+        Err(err) => err,
+        Ok(_) => panic!("INTRA+Q on an I-frame must be rejected"),
+    };
     assert!(
-        pic.y.iter().all(|&p| p == 128),
-        "v1 INTRA+Q DC-only luma must reconstruct flat grey 128"
+        err.to_string().contains("INTRA+Q"),
+        "unexpected error: {err}"
     );
-    // See v1_iframe_intra_dc_only_decodes_flat_grey: chroma snaps to
-    // 1020 (quantised-domain DC prediction) → 128 through the spec/19
-    // §1 integer kernel.
-    assert!(pic.cb.iter().all(|&p| p == 128));
-    assert!(pic.cr.iter().all(|&p| p == 128));
 }
 
 #[test]
@@ -427,7 +430,7 @@ fn v2_pframe_intra_in_p_decodes() {
     // reads ac_pred + CBPY, then the 6 intra blocks.
     let (dims, reference) = gradient_reference();
     let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V2_RAW, 4);
-    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15); // post-wrap 0
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 0); // as coded: no luma
     let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
     let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
     let mut fields = v2_pframe_header(8);
@@ -483,10 +486,11 @@ fn g5_code_for(last: bool, run: u8, level: u16) -> Option<(u32, u32)> {
 ///
 /// Intra-in-P is v2 MCBPC quotient 1 (symbol 4 → mb_type 3). The v2
 /// decoder reads the ac_pred bit then CBPY-with-wrap; to set luma block 0
-/// only (final cbpy = 0b1000 = 8) we feed CBPY raw = 15 − 8 = 7.
+/// only (final cbpy = 0b1000 = 8) we feed CBPY 8 as coded: v2 intra MBs
+/// read CBPY without the inter wrap.
 fn build_v2_pframe_intra_in_p_coded(ac_pred: u32) -> Vec<u8> {
     let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V2_RAW, 4); // quotient 1 → intra
-    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 7); // wrap → 8 (block 0)
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 8); // as coded: block 0
     let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0); // DC diff 0
     let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
 
@@ -1100,15 +1104,14 @@ fn send_packet_v2_iframe_decodes_intra() {
     params.height = Some(16);
     let mut dec = reg.first_decoder(&params).expect("decoder creation");
 
-    // v2 I-frame: type 0 + quant 8, then one intra MB (no skip bit on
-    // I-frames): MCBPC sym 4 (quotient 1 → intra), ac_pred 0, CBPY raw
-    // 15 → post-wrap 0, six DC-size-0 codewords.
-    let (mcbpc_code, mcbpc_bl) = code_for(MCBPC_V2_RAW, 4);
-    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 15);
+    // v2 I-frame: type 0 + quant 8 + slice code 23 (one slice), then one
+    // intra MB (no skip bit, no MB type on I-frames): intra CBPC 0 (`1`),
+    // ac_pred 0, CBPY 0 as coded, six DC-size-0 codewords.
+    let (cbpy_code, cbpy_bl) = code_for(CBPY_V1_V2_RAW, 0);
     let (luma0_code, luma0_bl) = code_for(DC_SIZE_LUMA_V1V2_RAW, 0);
     let (chroma0_code, chroma0_bl) = code_for(DC_SIZE_CHROMA_V1V2_RAW, 0);
-    let mut fields: Vec<(u32, u32)> = vec![(0, 2), (8, 5)];
-    fields.push((mcbpc_code, mcbpc_bl));
+    let mut fields: Vec<(u32, u32)> = vec![(0, 2), (8, 5), (23, 5)];
+    fields.push((1, 1)); // intra CBPC 0
     fields.push((0, 1)); // ac_pred = 0
     fields.push((cbpy_code, cbpy_bl));
     for _ in 0..4 {

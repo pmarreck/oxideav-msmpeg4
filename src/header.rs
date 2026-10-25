@@ -371,10 +371,17 @@ pub struct MsV1V2PictureHeader {
     pub picture_type: PictureType,
     /// Frame-wide quantiser, 1..=31.
     pub quant: u8,
-    /// **v1 only**: Unrestricted-Motion-Vectors flag (H.263 Annex D),
-    /// stored at `[esi+0x88]`. Read on P-frames per spec/99 §2.4. Always
-    /// `false` for v2 frames and for v1 I-frames.
-    pub v1_umv_flag: bool,
+    /// **I-frames only**: the 5-bit slice code that follows PQUANT. v1
+    /// stores the slice height in macroblock rows directly (`1..=31`,
+    /// at most the picture's row count); v2 stores `22 + slice_count`,
+    /// the same encoding as v3's `iframe_ext` (see
+    /// [`crate::picture::slice_rows_for`]). Always `0` on P-frames.
+    pub slice_code: u8,
+    /// **P-frames only**: whether every macroblock header opens with a
+    /// 1-bit skip flag. v2 carries the choice in the picture header
+    /// (the reference decoder's `use_skip_mb_code`); v1 always uses
+    /// skip flags. Always `false` on I-frames.
+    pub use_skip_mb_code: bool,
 }
 
 /// The v3-only per-frame selector defaults that v1 / v2 consumers must
@@ -517,7 +524,8 @@ impl MsV1V2PictureHeader {
 
 impl MsV1V2PictureHeader {
     /// Parse a v1 picture header. Consumes the 37-bit opaque preamble
-    /// first, then the picture-type / PQUANT / (P-only) UMV-flag fields.
+    /// first, then the picture-type / PQUANT fields, the I-frame slice
+    /// height or nothing more for a P-frame (v1 always uses skip flags).
     ///
     /// Per spec/99 §2.1: the preamble is "32 bits read and discarded at
     /// `1c211f35`, then 5 more at `1c211f40`" — never matched against a
@@ -526,33 +534,37 @@ impl MsV1V2PictureHeader {
         // 37-bit opaque preamble (32 + 5). Consume but discard.
         let _ = br.read_u32(32)?;
         let _ = br.read_u32(5)?;
-        Self::parse_inner(br, /*has_umv=*/ true)
+        Self::parse_inner(br, /*v1=*/ true)
     }
 
-    /// Parse a v2 picture header. No preamble, no UMV flag.
+    /// Parse a v2 picture header: no preamble; 2-bit type, 5-bit
+    /// PQUANT, then the 5-bit slice code (I) or the 1-bit
+    /// `use_skip_mb_code` flag (P).
     pub fn parse_v2(br: &mut BitReader<'_>) -> Result<Self> {
-        Self::parse_inner(br, /*has_umv=*/ false)
+        Self::parse_inner(br, /*v1=*/ false)
     }
 
     /// Serialise a v1 picture header — the inverse of
     /// [`Self::parse_v1`]. The 37-bit preamble is opaque on the decode
     /// side (read-and-discarded, never matched against a pattern per
     /// spec/99 §2.1), so the encoder writes it as zeros; then the
-    /// shared 2-bit type + 5-bit PQUANT, and — P-frames only — the
-    /// UMV flag from `self.v1_umv_flag`.
+    /// shared 2-bit type + 5-bit PQUANT, and — I-frames only — the
+    /// 5-bit slice height from `self.slice_code`. v1 P-frames carry no
+    /// skip-mode flag (skip flags are always used).
     pub fn write_v1(&self, bw: &mut BitWriter) -> Result<()> {
         bw.write_u32(0, 32);
         bw.write_u32(0, 5);
-        self.write_inner(bw, /*has_umv=*/ true)
+        self.write_inner(bw, /*v1=*/ true)
     }
 
     /// Serialise a v2 picture header — the inverse of
-    /// [`Self::parse_v2`]: 2-bit type + 5-bit PQUANT, nothing else.
+    /// [`Self::parse_v2`]: 2-bit type + 5-bit PQUANT, then the 5-bit
+    /// slice code (I) or the 1-bit `use_skip_mb_code` flag (P).
     pub fn write_v2(&self, bw: &mut BitWriter) -> Result<()> {
-        self.write_inner(bw, /*has_umv=*/ false)
+        self.write_inner(bw, /*v1=*/ false)
     }
 
-    fn write_inner(&self, bw: &mut BitWriter, has_umv: bool) -> Result<()> {
+    fn write_inner(&self, bw: &mut BitWriter, v1: bool) -> Result<()> {
         if !(1..=31).contains(&self.quant) {
             return Err(Error::invalid(format!(
                 "msmpeg4 v1/v2: pquant {} out of range 1..=31",
@@ -564,13 +576,26 @@ impl MsV1V2PictureHeader {
             PictureType::P => bw.write_u32(1, 2),
         }
         bw.write_u32(self.quant as u32, 5);
-        if has_umv && self.picture_type == PictureType::P {
-            bw.write_bit(self.v1_umv_flag);
+        match self.picture_type {
+            PictureType::I => {
+                if self.slice_code > 31 {
+                    return Err(Error::invalid(format!(
+                        "msmpeg4 v1/v2: slice code {} does not fit 5 bits",
+                        self.slice_code
+                    )));
+                }
+                bw.write_u32(self.slice_code as u32, 5);
+            }
+            PictureType::P => {
+                if !v1 {
+                    bw.write_bit(self.use_skip_mb_code);
+                }
+            }
         }
         Ok(())
     }
 
-    fn parse_inner(br: &mut BitReader<'_>, has_umv: bool) -> Result<Self> {
+    fn parse_inner(br: &mut BitReader<'_>, v1: bool) -> Result<Self> {
         let ptype = br.read_u32(2)?;
         let picture_type = match ptype {
             0 => PictureType::I,
@@ -587,15 +612,15 @@ impl MsV1V2PictureHeader {
                 "msmpeg4 v1/v2: pquant {quant} out of range 1..=31"
             )));
         }
-        let v1_umv_flag = if has_umv && picture_type == PictureType::P {
-            br.read_bit()?
-        } else {
-            false
+        let (slice_code, use_skip_mb_code) = match picture_type {
+            PictureType::I => (br.read_u32(5)? as u8, false),
+            PictureType::P => (0, v1 || br.read_bit()?),
         };
         Ok(Self {
             picture_type,
             quant,
-            v1_umv_flag,
+            slice_code,
+            use_skip_mb_code,
         })
     }
 }
@@ -723,67 +748,78 @@ mod tests {
     fn v1_iframe_header_parses() {
         // 37-bit opaque preamble (any value), then I-frame header.
         // 32 zero bits + 5 zero bits = 37-bit zero preamble; then
-        // picture_type=0 (I, 2 bits), quant=10 (5 bits).
+        // picture_type=0 (I, 2 bits), quant=10 (5 bits), slice height
+        // 9 rows (5 bits).
         let bytes = pack(&[
             (0, 32), // preamble lo
             (0, 5),  // preamble hi
             (0, 2),  // picture_type = I
             (10, 5), // quant = 10
+            (9, 5),  // slice height = 9 macroblock rows
         ]);
         let mut br = BitReader::new(&bytes);
         let h = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
         assert_eq!(h.picture_type, PictureType::I);
         assert_eq!(h.quant, 10);
-        assert!(!h.v1_umv_flag, "I-frame must not have UMV flag set");
+        assert_eq!(h.slice_code, 9);
+        assert!(!h.use_skip_mb_code, "I-frames carry no skip-mode flag");
+        assert_eq!(br.bit_position(), 37 + 2 + 5 + 5);
     }
 
     #[test]
-    fn v1_pframe_with_umv_flag_parses() {
+    fn v1_pframe_always_uses_skip_flags() {
         let bytes = pack(&[
             (0xdead_beef, 32), // preamble lo (any opaque)
             (0x1f, 5),         // preamble hi (any opaque)
             (1, 2),            // picture_type = P
             (8, 5),            // quant = 8
-            (1, 1),            // UMV flag = 1
+            (1, 1),            // canary: the first MB's skip flag
         ]);
         let mut br = BitReader::new(&bytes);
         let h = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
         assert_eq!(h.picture_type, PictureType::P);
         assert_eq!(h.quant, 8);
-        assert!(h.v1_umv_flag);
+        assert!(h.use_skip_mb_code, "v1 P-frames always use skip flags");
+        assert_eq!(h.slice_code, 0);
+        assert_eq!(br.bit_position(), 37 + 2 + 5, "no header bit after PQUANT");
+        assert!(br.read_bit().unwrap(), "the canary belongs to the first MB");
     }
 
     #[test]
     fn v2_iframe_header_parses_without_preamble() {
-        // No preamble in v2 — reads picture_type (2 bits) immediately.
-        let bytes = pack(&[(0, 2), (15, 5)]);
+        // No preamble in v2 — reads picture_type (2 bits) immediately,
+        // then PQUANT and the 5-bit slice code (23 = one slice).
+        let bytes = pack(&[(0, 2), (15, 5), (23, 5)]);
         let mut br = BitReader::new(&bytes);
         let h = MsV1V2PictureHeader::parse_v2(&mut br).unwrap();
         assert_eq!(h.picture_type, PictureType::I);
         assert_eq!(h.quant, 15);
-        assert!(!h.v1_umv_flag, "v2 has no UMV flag");
+        assert_eq!(h.slice_code, 23);
+        assert!(!h.use_skip_mb_code);
+        assert_eq!(br.bit_position(), 12);
     }
 
     #[test]
-    fn v2_pframe_does_not_read_umv_bit() {
-        // After picture_type + quant, the v2 path must NOT consume the
-        // next bit (which would belong to MCBPCY's skip flag in real
-        // streams). Verify by checking the bit-reader position after the
-        // header.
-        let bytes = pack(&[
-            (1, 2),  // P
-            (12, 5), // quant
-            (1, 1),  // following bit (would-be skip flag in MCBPCY)
-        ]);
-        let mut br = BitReader::new(&bytes);
-        let h = MsV1V2PictureHeader::parse_v2(&mut br).unwrap();
-        assert_eq!(h.picture_type, PictureType::P);
-        assert_eq!(h.quant, 12);
-        assert!(!h.v1_umv_flag);
-        // The bit that we appended after the header must still be
-        // available — bit reader should sit at offset 7 (2+5) bits.
-        let next = br.read_bit().unwrap();
-        assert!(next, "next bit should be the 1 we packed (skip bit)");
+    fn v2_pframe_reads_use_skip_mb_code() {
+        // After picture_type + quant a v2 P-frame carries exactly one
+        // more header bit, the skip-mode flag; the bit after it belongs
+        // to the first macroblock.
+        for &(flag, canary) in &[(true, false), (false, true)] {
+            let bytes = pack(&[
+                (1, 2),             // P
+                (12, 5),            // quant
+                (flag as u32, 1),   // use_skip_mb_code
+                (canary as u32, 1), // first MB bit
+            ]);
+            let mut br = BitReader::new(&bytes);
+            let h = MsV1V2PictureHeader::parse_v2(&mut br).unwrap();
+            assert_eq!(h.picture_type, PictureType::P);
+            assert_eq!(h.quant, 12);
+            assert_eq!(h.use_skip_mb_code, flag);
+            assert_eq!(h.slice_code, 0);
+            assert_eq!(br.bit_position(), 8);
+            assert_eq!(br.read_bit().unwrap(), canary);
+        }
     }
 
     #[test]
@@ -968,37 +1004,37 @@ mod tests {
             (0, 5),  // preamble hi
             (1, 2),  // P
             (16, 5), // quant
-            (0, 1),  // UMV flag = 0
+            (0, 1),  // first MB's skip flag (not a header field)
         ]);
         let mut br = BitReader::new(&bytes);
         let h = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
         assert_eq!(h.picture_type, PictureType::P);
         assert_eq!(h.quant, 16);
-        assert!(!h.v1_umv_flag, "umv = 0 must round-trip as false");
-        // Bit position is 37 (preamble) + 2 + 5 + 1 = 45.
-        assert_eq!(br.bit_position(), 45);
+        assert!(h.use_skip_mb_code);
+        // Bit position is 37 (preamble) + 2 + 5 = 44.
+        assert_eq!(br.bit_position(), 44);
     }
 
     #[test]
-    fn v1_iframe_does_not_read_umv_bit() {
-        // Per parse_v1: the UMV bit is gated on `picture_type == P` —
-        // an I-frame must not consume a 38th bit. Verify by appending a
-        // canary 1-bit after the header and asserting it survives.
+    fn v1_iframe_reads_only_the_slice_height() {
+        // After PQUANT an I-frame header carries exactly the 5-bit
+        // slice height; a canary 1-bit after it must survive.
         let bytes = pack(&[
             (0, 32), // preamble lo
             (0, 5),  // preamble hi
             (0, 2),  // picture_type = I
             (10, 5), // quant
+            (3, 5),  // slice height
             (1, 1),  // canary bit — must NOT be consumed by parse_v1
         ]);
         let mut br = BitReader::new(&bytes);
         let h = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
         assert_eq!(h.picture_type, PictureType::I);
         assert_eq!(h.quant, 10);
-        assert!(!h.v1_umv_flag);
-        // Bit position is 37 (preamble) + 2 + 5 = 44 — the canary is
-        // STILL available to the caller.
-        assert_eq!(br.bit_position(), 44);
+        assert_eq!(h.slice_code, 3);
+        // Bit position is 37 (preamble) + 2 + 5 + 5 = 49 — the canary
+        // is STILL available to the caller.
+        assert_eq!(br.bit_position(), 49);
         let next = br.read_bit().unwrap();
         assert!(next, "I-frame parser must not have consumed the canary bit");
     }

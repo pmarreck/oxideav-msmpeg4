@@ -484,6 +484,41 @@ fn slice_rows_for_reference(reference: &Picture, mb_h: usize) -> usize {
     }
 }
 
+/// Macroblock rows per prediction slice of a v1 / v2 I-frame from the
+/// 5-bit slice code that follows PQUANT
+/// ([`MsV1V2PictureHeader::slice_code`]). v1 codes the slice height
+/// directly (`1..=mb_rows`); v2 uses the v3 `22 + slices` encoding of
+/// [`slice_rows_for`]. Slice boundaries restart DC / AC prediction and
+/// gate the MV predictor's top side exactly as in v3.
+pub fn slice_rows_for_v1v2(version: MsV1V2Version, slice_code: u8, mb_h: usize) -> Result<usize> {
+    match version {
+        MsV1V2Version::V1 => {
+            let rows = slice_code as usize;
+            if rows == 0 || rows > mb_h {
+                return Err(Error::invalid(format!(
+                    "msmpeg4v1: slice height {rows} is outside 1..={mb_h} macroblock rows"
+                )));
+            }
+            Ok(rows)
+        }
+        MsV1V2Version::V2 => slice_rows_for(slice_code, mb_h),
+    }
+}
+
+/// [`slice_rows_for_v1v2`] for a P-frame, whose slice geometry is the
+/// reference picture's. A reference without the field means one slice.
+fn slice_rows_for_reference_v1v2(
+    version: MsV1V2Version,
+    reference: &Picture,
+    mb_h: usize,
+) -> usize {
+    if reference.iframe_ext == 0 {
+        mb_h
+    } else {
+        slice_rows_for_v1v2(version, reference.iframe_ext, mb_h).unwrap_or(mb_h)
+    }
+}
+
 /// Decode a full v3 I-frame into a [`Picture`].
 ///
 /// This walks every MB in raster order, decodes its 6 blocks
@@ -1299,17 +1334,25 @@ fn decode_pframe_v1v2(
     // inter/chroma DCT descriptor to G4 unconditionally — there is no
     // per-frame AC selector in the v1/v2 picture header (spec/01 §1.4:
     // the selector reads gate on `version == 3`).
-    let inter_ac = crate::ac::AcVlcTable::g4_inter();
     // Intra-in-P AC tables (spec/14 §3.2): v1/v2 default luma DCT = G5,
-    // chroma = G4. Same descriptors as the v1/v2 I-frame path.
-    let intra_luma_ac = AcVlcTable::v3_intra_g5();
-    let intra_chroma_ac = AcVlcTable::g4_inter();
+    // chroma = G4, inter = G4; the escape body follows the version
+    // (`AcVlcTable::v1v2_tables`). Same descriptors as the I-frame path.
+    let (intra_luma_ac, intra_chroma_ac, inter_ac) =
+        AcVlcTable::v1v2_tables(version == MsV1V2Version::V1);
     let mut mv_grid = crate::mv_pred::MvGrid::new(mb_w, mb_h);
     // DC prediction cache for the intra-in-P MBs (the spatial DC
     // predictor is shared with the I-frame path / v3 per spec/99 §4.4).
     let mut dc_cache = DcCache::for_v1v2(mb_w, mb_h);
+    // The slice geometry is the reference I-frame's (the slice code is
+    // read on I-frames only); P-frames carry it forward.
+    pic.iframe_ext = reference.iframe_ext;
+    let slice_rows = slice_rows_for_reference_v1v2(version, reference, mb_h);
 
     for my in 0..mb_h {
+        let top_boundary = my % slice_rows == 0;
+        if my > 0 && top_boundary {
+            dc_cache.reset();
+        }
         for mx in 0..mb_w {
             decode_pframe_mb_v1v2(
                 br,
@@ -1319,8 +1362,10 @@ fn decode_pframe_v1v2(
                 reference,
                 mx,
                 my,
+                top_boundary,
                 quant,
                 version,
+                hdr.use_skip_mb_code,
                 codec,
                 &inter_ac,
                 &intra_luma_ac,
@@ -1345,8 +1390,10 @@ fn decode_pframe_mb_v1v2(
     reference: &Picture,
     mb_x: usize,
     mb_y: usize,
+    top_boundary: bool,
     quant: u32,
     version: MsV1V2Version,
+    use_skip_mb_code: bool,
     codec: &'static str,
     inter_ac: &AcVlcTable,
     intra_luma_ac: &AcVlcTable,
@@ -1356,7 +1403,14 @@ fn decode_pframe_mb_v1v2(
 
     let decode = match version {
         MsV1V2Version::V1 => decode_mcbpcy_v1(br)?,
-        MsV1V2Version::V2 => decode_mcbpcy_v2(br, V2FrameType::P)?,
+        MsV1V2Version::V2 => {
+            let frame_type = if use_skip_mb_code {
+                V2FrameType::P
+            } else {
+                V2FrameType::PNoSkip
+            };
+            decode_mcbpcy_v2(br, frame_type)?
+        }
     };
 
     if decode.skip {
@@ -1433,7 +1487,7 @@ fn decode_pframe_mb_v1v2(
             // v3 per spec/07 §3.5), two separate component reads against
             // the shared 65-entry table (spec/07 §3.2), bias subtract +
             // toroidal wrap inside `decode_mv_v1v2`.
-            let predictor = one_mv_predictor(mv_grid, mb_x, mb_y, false);
+            let predictor = one_mv_predictor(mv_grid, mb_x, mb_y, top_boundary);
             let mv = crate::mv::decode_mv_v1v2(br, predictor)?;
             mv_grid.set_cell(mb_x, mb_y, crate::mv_pred::MvGridCell::OneMv(mv));
             apply_mc_to_mb(pic, reference, mb_x, mb_y, (mv.x as i32, mv.y as i32), 0);
@@ -1445,7 +1499,7 @@ fn decode_pframe_mb_v1v2(
             // `Macroblock4MvDecoderNeighbours` driver (handles a mix of
             // 1-MV / 4-MV / absent neighbours per spec §7.6.5).
             use crate::mv_pred::{Block, Macroblock4MvDecoderNeighbours};
-            let nset = mv_grid.neighbour_set_for(mb_x, mb_y);
+            let nset = mv_grid.neighbour_set_for_slice(mb_x, mb_y, top_boundary);
             let mut dec = Macroblock4MvDecoderNeighbours::new(nset);
             let mut block_mvs = [crate::mv::Mv::default(); 4];
             for (i, &block) in Block::ALL.iter().enumerate() {
@@ -1512,7 +1566,7 @@ fn decode_iframe_v1v2(
     hdr: &MsV1V2PictureHeader,
     version: MsV1V2Version,
 ) -> Result<Picture> {
-    use crate::mcbpcy::{V2FrameType, decode_mcbpcy_v1, decode_mcbpcy_v2};
+    use crate::mcbpcy::{decode_mcbpcy_v1_iframe, decode_mcbpcy_v2_iframe};
 
     let (mb_w, mb_h) = dims.mb_dims();
     let mut pic = Picture::alloc(dims, PictureType::I);
@@ -1520,19 +1574,27 @@ fn decode_iframe_v1v2(
     let quant = hdr.quant as u32;
     // Spec/14 §3.2: v1/v2 default luma DCT descriptor = G5, chroma = G4.
     // Neither has a per-frame selector in v1/v2 (the AC-selector reads
-    // gate on version == 3 per spec/01 §1.4).
-    let luma_ac = AcVlcTable::v3_intra_g5();
-    let chroma_ac = AcVlcTable::g4_inter();
+    // gate on version == 3 per spec/01 §1.4); the escape body follows
+    // the version (`AcVlcTable::v1v2_tables`).
+    let (luma_ac, chroma_ac, _) = AcVlcTable::v1v2_tables(version == MsV1V2Version::V1);
+    // The I-frame header's slice code fixes the prediction-slice height
+    // for this picture and the P-frames that follow it.
+    let slice_rows = slice_rows_for_v1v2(version, hdr.slice_code, mb_h)?;
+    pic.iframe_ext = hdr.slice_code;
 
     for my in 0..mb_h {
+        if my > 0 && my % slice_rows == 0 {
+            // Predictor restart at a slice boundary: DC and AC prediction
+            // start over (same rule as the v3 I-frame walk).
+            dc_cache.reset();
+        }
         for mx in 0..mb_w {
-            // Decode the v1/v2 MB header. On an I-frame every MB is intra
-            // (the MCBPC alphabet's intra MB-types); v1 still reads its
-            // leading COD bit unconditionally (spec/07 §1.5 — it is 0 on
-            // I-frames), v2 reads no skip bit in I-frame mode.
+            // Decode the I-frame MB header: every MB is intra and there is
+            // no skip bit; v1 uses the H.263 intra MCBPC, v2 its 4-symbol
+            // intra CBPC followed by the AC-prediction bit.
             let decode = match version {
-                MsV1V2Version::V1 => decode_mcbpcy_v1(br)?,
-                MsV1V2Version::V2 => decode_mcbpcy_v2(br, V2FrameType::I)?,
+                MsV1V2Version::V1 => decode_mcbpcy_v1_iframe(br)?,
+                MsV1V2Version::V2 => decode_mcbpcy_v2_iframe(br)?,
             };
             if !decode.is_intra {
                 return Err(Error::invalid(format!(
@@ -1559,7 +1621,13 @@ fn decode_iframe_v1v2(
                 quant,
                 &luma_ac,
                 &chroma_ac,
-            )?;
+            )
+            .map_err(|e| {
+                Error::invalid(format!(
+                    "msmpeg4 v1/v2 I-frame: MB ({mx}, {my}) at bit {}: {e}",
+                    br.bit_position()
+                ))
+            })?;
         }
     }
 

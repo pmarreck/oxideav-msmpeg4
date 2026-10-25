@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- v1/v2 picture headers: I-frames carry a 5-bit slice code after PQUANT (v1 the slice height in macroblock rows, v2 the v3 `22 + slices` form) and v2 P-frames a 1-bit `use_skip_mb_code` flag; the former "UMV" bit read on v1 P-frames never existed. Slice boundaries now restart DC/AC prediction and gate the MV predictor's top side in v1/v2 pictures too.
+- v1/v2 I-frame macroblock headers use the intra layout: v2 reads its 4-symbol intra CBPC, the AC-prediction bit and CBPY as coded; v1 reads the H.263 intra MCBPC with no COD bit. v2 intra-in-P macroblocks read CBPY as coded as well (only inter MBs and v1 P-frame MBs wrap it).
+- v2 chroma and inter blocks walk the same three-arm escape ladder as v3 (with no extra run on the run-extension arm); the single fixed-length escape body is v1's. An FFmpeg-encoded MP42 stream now decodes frame-exact (PSNR > 50 dB against its decode).
+
 ### Changed
 
 - motion compensation edge-extends references from the coded (macroblock-aligned) picture instead of the visible size, so at widths or heights that are not multiples of 16 the last macroblock's samples past the visible edge predict as they do in deployed decoders (previously up to |Δ| 31 in the right-hand columns of a 170×98 stream)

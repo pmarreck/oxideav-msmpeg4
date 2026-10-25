@@ -64,38 +64,41 @@ fn v1_decoder_skip_path_does_not_consume_mcbpc_bits() {
 
 #[test]
 fn v2_iframe_does_not_read_skip_bit() {
-    // For I-frames v2 omits the skip bit. We test by constructing a
-    // single-bit stream that would parse as `skip = 1` on a P-frame
-    // but, on an I-frame, must instead try (and fail) to match the
-    // single bit as an MCBPC code.
-    //
-    // MCBPC sym 0 has bl=1 code=`1`, so a `1` bit followed by CBPY
-    // pattern 15 (bl=2 code=`11`) decodes successfully.
-    let bytes = pack(&[(1, 1), (0b11, 2)]);
+    // For I-frames v2 omits the skip bit and the MB type: a `1` bit
+    // that would parse as `skip = 1` on a P-frame is the intra CBPC
+    // code for "no chroma coded". Then ac_pred = 0 and CBPY pattern 15
+    // (bl=2 code=`11`) read as coded.
+    let bytes = pack(&[(1, 1), (0, 1), (0b11, 2)]);
     let mut br = BitReader::new(&bytes);
     let dec = decode_mcbpcy_v2(&mut br, V2FrameType::I).unwrap();
     assert!(!dec.skip);
-    assert_eq!(dec.mb_type, 0); // sym 0 → quotient=0 → mb_type=0
+    assert!(dec.is_intra);
+    assert_eq!(dec.mb_type, 3);
+    assert!(!dec.cbp_cb && !dec.cbp_cr);
+    assert_eq!(dec.cbpy, 15);
+    assert!(!dec.ac_pred);
 }
 
 #[test]
 fn v1_picture_header_parse_round_trip() {
-    // 37-bit zero preamble + I-frame header q=12.
-    let bytes = pack(&[(0, 32), (0, 5), (0, 2), (12, 5)]);
+    // 37-bit zero preamble + I-frame header q=12, slice height 4.
+    let bytes = pack(&[(0, 32), (0, 5), (0, 2), (12, 5), (4, 5)]);
     let mut br = BitReader::new(&bytes);
     let h = MsV1V2PictureHeader::parse_v1(&mut br).unwrap();
     assert_eq!(h.picture_type, PictureType::I);
     assert_eq!(h.quant, 12);
-    assert!(!h.v1_umv_flag);
+    assert_eq!(h.slice_code, 4);
+    assert!(!h.use_skip_mb_code);
 }
 
 #[test]
 fn v2_picture_header_parse_round_trip() {
-    let bytes = pack(&[(1, 2), (8, 5)]);
+    let bytes = pack(&[(1, 2), (8, 5), (1, 1)]);
     let mut br = BitReader::new(&bytes);
     let h = MsV1V2PictureHeader::parse_v2(&mut br).unwrap();
     assert_eq!(h.picture_type, PictureType::P);
     assert_eq!(h.quant, 8);
+    assert!(h.use_skip_mb_code);
 }
 
 /// Round 75 — confirm the shared v1/v2 CBPY codes used at decode time
